@@ -101,6 +101,8 @@ MCP Inspector provides a full-featured interface for security testing MCP server
 
 
 ## Screenshots
+![alt text](https://raw.githubusercontent.com/Manjesh24/MCP-Inspector/master/images/MCP%20Inspector.jpg)
+![alt text](https://raw.githubusercontent.com/Manjesh24/MCP-Inspector/master/images/MCP%20Inspector%20-%202.jpg)
 
 ### Main Interface
 The extension provides a tabbed interface with:
