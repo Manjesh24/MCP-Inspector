@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
-# MCP Inspector
+# MCP Inspector v2.0 - Ultimate MCP Security Testing Extension
 # Author : Manjesh S
+# Enhanced with WebSocket and Security Testing Features
 
 from burp import IBurpExtender, ITab, IMessageEditorController
 from javax.swing import (JPanel, JButton, JTextField, JLabel,
                          JScrollPane, JTable, JOptionPane, JTextArea,
                          JTabbedPane, JCheckBox, JSpinner, SpinnerNumberModel, 
                          BorderFactory, JSplitPane, JComboBox, DefaultComboBoxModel,
-                         SwingUtilities, JPopupMenu, JMenuItem, Box, UIManager)
-from java.awt import BorderLayout, Dimension, FlowLayout, GridLayout, Font, Color, GridBagLayout, GridBagConstraints, Insets
+                         SwingUtilities, JPopupMenu, JMenuItem, Box, UIManager,
+                         JProgressBar, JTree, ButtonGroup, JRadioButton)
+from javax.swing.tree import DefaultMutableTreeNode, DefaultTreeModel
+from java.awt import BorderLayout, Dimension, FlowLayout, GridLayout, Font, Color, GridBagLayout, GridBagConstraints, Insets, Cursor
 from javax.swing.table import DefaultTableModel
 from java.awt.event import MouseAdapter
 import json
@@ -16,6 +19,7 @@ import threading
 import traceback
 import re
 import time
+import os
 
 from java.net.http import HttpClient, HttpRequest, HttpResponse
 from java.net import URI
@@ -24,8 +28,20 @@ from java.nio.charset import StandardCharsets
 from java.io import BufferedReader, InputStreamReader
 from java.net import URL
 
+# WebSocket imports for dual transport support
+try:
+    from java.net.http import WebSocket
+    WEBSOCKET_AVAILABLE = True
+except:
+    WEBSOCKET_AVAILABLE = False
+
+
+
+
 class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
-    """MCP Inspector - Burp Suite Extension """
+    """MCP Inspector v2.0 - Ultimate MCP Security Testing Extension"""
+    
+    VERSION = "2.0"
     
     def __init__(self):
         self.session_id = None
@@ -37,12 +53,21 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         self.protocol_version = None
         self.sse_thread = None
         self.sse_running = False
+        self.ws_running = False
+        self.websocket = None
         self.pending_requests = {}
         self.sse_endpoint = None
         self.custom_headers = {}
         self.last_progress_time = {}
         self.request_history = []
         self.history_index = -1
+        
+        # Transport settings
+        self.transport_type = "SSE"  # SSE, WebSocket, or Auto
+        
+        # Logging settings
+        self.verbose_logging = False  # Disable verbose logs for high-throughput (Intruder)
+        self.max_log_lines = 1000  # Reduced for performance
         
         # Settings
         self.request_timeout = 30
@@ -53,7 +78,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         """Extender API entry point"""
         self._callbacks = callbacks
         self._helpers   = callbacks.getHelpers()
-        callbacks.setExtensionName("MCP Inspector")
+        callbacks.setExtensionName("MCP Inspector v" + self.VERSION)
         self._init_ui()
         callbacks.addSuiteTab(self)
 
@@ -61,6 +86,9 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
             .version(HttpClient.Version.HTTP_2) \
             .connectTimeout(Duration.ofSeconds(30)) \
             .build()
+        
+        self._log("MCP Inspector v%s loaded successfully" % self.VERSION)
+        self._log("WebSocket support: %s" % ("Available" if WEBSOCKET_AVAILABLE else "Not available"))
 
     def _get_theme_colors(self):
         """Detect theme and return appropriate colors"""
@@ -105,21 +133,41 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         # Top connection panel
         top_panel = JPanel(BorderLayout())
         
-        # Connection controls
+        # Connection controls - first row
         conn_panel = JPanel(FlowLayout(FlowLayout.LEFT))
-        self.url_field = JTextField("https://localhost/mcp", 40)
+        self.url_field = JTextField("https://localhost/mcp", 35)
+        
+        # Transport selector
+        self.transport_combo = JComboBox(["Auto", "SSE", "WebSocket"])
+        self.transport_combo.setToolTipText("Select transport type (Auto will detect)")
+        
         self.connect_btn = JButton("Connect", actionPerformed=self._on_connect_click)
+        self.connect_btn.setBackground(Color(46, 139, 87))
+        self.connect_btn.setForeground(Color.WHITE)
+        self.connect_btn.setOpaque(True)
+        
         self.disconnect_btn = JButton("Disconnect", actionPerformed=self._on_disconnect_click)
         self.disconnect_btn.setEnabled(False)
-        self.headers_btn = JButton("Headers", actionPerformed=self._edit_headers)
-        self.settings_btn = JButton("Timeouts", actionPerformed=self._edit_settings)
         
         conn_panel.add(JLabel("Endpoint:"))
         conn_panel.add(self.url_field)
+        conn_panel.add(JLabel("Transport:"))
+        conn_panel.add(self.transport_combo)
         conn_panel.add(self.connect_btn)
         conn_panel.add(self.disconnect_btn)
-        conn_panel.add(self.headers_btn)
-        conn_panel.add(self.settings_btn)
+        
+        # Second row - Settings
+        settings_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        self.headers_btn = JButton("Headers", actionPerformed=self._edit_headers)
+        self.settings_btn = JButton("Settings", actionPerformed=self._edit_settings)
+        
+        settings_panel.add(self.headers_btn)
+        settings_panel.add(self.settings_btn)
+        
+        # Connection panel wrapper
+        conn_wrapper = JPanel(BorderLayout())
+        conn_wrapper.add(conn_panel, BorderLayout.NORTH)
+        conn_wrapper.add(settings_panel, BorderLayout.SOUTH)
         
         # Prominent status bar
         status_panel = JPanel(FlowLayout(FlowLayout.LEFT))
@@ -132,10 +180,37 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         self.status_indicator.setBackground(self.theme_colors["indicator_ready"])
         status_panel.add(self.status_indicator)
         status_panel.add(self.status_label)
+        
+        # Persistent proxy indicator (hidden when OFF, clickable when ON)
+        status_panel.add(JLabel("    "))  # Spacer
+        self.proxy_indicator = JLabel("  PROXY: ON  ")
+        self.proxy_indicator.setFont(Font("SansSerif", Font.BOLD, 12))
+        self.proxy_indicator.setForeground(Color.WHITE)
+        self.proxy_indicator.setBackground(Color(0, 128, 0))
+        self.proxy_indicator.setOpaque(True)
+        self.proxy_indicator.setBorder(BorderFactory.createEmptyBorder(2, 6, 2, 6))
+        self.proxy_indicator.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
+        self.proxy_indicator.setToolTipText("Click to go to Virtual Proxy tab")
+        self.proxy_indicator.setVisible(False)  # Hidden by default
+        
+        # Store reference to main_tabs for navigation (will be set after tabs are created)
+        self.main_tabs = None
+        
+        # Add click listener
+        class ProxyClickListener(MouseAdapter):
+            def __init__(self, extender):
+                self.extender = extender
+            def mouseClicked(self, event):
+                if self.extender.main_tabs:
+                    # Find and switch to Virtual Proxy tab (index 4)
+                    self.extender.main_tabs.setSelectedIndex(4)
+        self.proxy_indicator.addMouseListener(ProxyClickListener(self))
+        status_panel.add(self.proxy_indicator)
+        
         status_panel.setBackground(self.theme_colors["status_bg"])
         status_panel.setBorder(BorderFactory.createLineBorder(self.theme_colors["status_border"]))
         
-        top_panel.add(conn_panel, BorderLayout.NORTH)
+        top_panel.add(conn_wrapper, BorderLayout.NORTH)
         top_panel.add(status_panel, BorderLayout.SOUTH)
         self.panel.add(top_panel, BorderLayout.NORTH)
 
@@ -154,13 +229,19 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         prompts_panel = self._create_prompts_tab()
         main_tabs.addTab("Prompts", prompts_panel)
 
+        # Virtual Proxy tab for Repeater/Intruder integration
+        proxy_panel = self._create_proxy_tab()
+        main_tabs.addTab("Virtual Proxy", proxy_panel)
+
         info_panel = self._create_info_tab()
         main_tabs.addTab("Server Info", info_panel)
 
         logs_panel = self._create_logs_tab()
         main_tabs.addTab("Logs", logs_panel)
 
+        self.main_tabs = main_tabs  # Store reference for proxy indicator click
         self.panel.add(main_tabs, BorderLayout.CENTER)
+
 
     def _create_tools_tab(self):
         panel = JPanel(BorderLayout())
@@ -200,6 +281,11 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
                     send_item = JMenuItem("Send to Request Editor")
                     send_item.addActionListener(lambda e: self.extender._send_tool_to_editor(tool_name))
                     popup.add(send_item)
+                    
+                    # NEW: Send to Repeater option
+                    repeater_item = JMenuItem("Send to Repeater")
+                    repeater_item.addActionListener(lambda e: self.extender._send_to_repeater(tool_name))
+                    popup.add(repeater_item)
                     
                     copy_item = JMenuItem("Copy Tool Name")
                     copy_item.addActionListener(lambda e: self.extender._copy_to_clipboard(tool_name))
@@ -372,15 +458,43 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         clear_btn = JButton("Clear Logs", actionPerformed=self._clear_logs)
         btn_panel.add(clear_btn)
         
+        # Verbose logging toggle
+        self.verbose_checkbox = JCheckBox("Verbose Logging", self.verbose_logging)
+        self.verbose_checkbox.addActionListener(lambda e: self._toggle_verbose())
+        self.verbose_checkbox.setToolTipText("When disabled, all logging is OFF to save memory and CPU")
+        btn_panel.add(self.verbose_checkbox)
+        
+        btn_panel.add(JLabel("  (Disable to save memory)"))
+        
         self.logs_area = JTextArea()
         self.logs_area.setEditable(False)
         self.logs_area.setFont(Font("Monospaced", Font.PLAIN, 11))
+        # Set initial placeholder since verbose_logging defaults to False
+        if not self.verbose_logging:
+            self.logs_area.setText("=== LOGGING DISABLED ===\n\nTo save memory, logging is OFF.\n\nTo enable logs:\n- Check 'Verbose Logging' checkbox above\n\nProxy status is shown in the status bar below.")
         logs_scroll = JScrollPane(self.logs_area)
         
         panel.add(btn_panel, BorderLayout.NORTH)
         panel.add(logs_scroll, BorderLayout.CENTER)
         
         return panel
+    
+    def _toggle_verbose(self):
+        self.verbose_logging = self.verbose_checkbox.isSelected()
+        # Always log toggle messages to extension output
+        if self.verbose_logging:
+            self._callbacks.printOutput("MCP: Verbose logging ENABLED - all logs active")
+            self.logs_area.setText("")  # Clear placeholder
+            self.proxy_log_area.setText("")  # Clear placeholder
+            self._log("Verbose logging ENABLED", force=True)
+        else:
+            self._callbacks.printOutput("MCP: Verbose logging DISABLED - all logs OFF to save memory")
+            # Show placeholder text in log areas
+            placeholder = "=== LOGGING DISABLED ===\n\nTo save memory, logging is OFF.\n\nTo enable logs:\n1. Go to 'Logs' tab\n2. Check 'Verbose Logging' checkbox\n\nProxy status is shown in the status bar below."
+            def update_logs():
+                self.logs_area.setText(placeholder)
+                self.proxy_log_area.setText(placeholder)
+            SwingUtilities.invokeLater(update_logs)
 
     def getTabCaption(self):   
         return "MCP Inspector"
@@ -507,15 +621,18 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         else:
             return obj
 
-    def _log(self, msg):
+    def _log(self, msg, force=False):
+        """Log message. Skipped entirely when verbose_logging is False, unless force=True."""
+        if not self.verbose_logging and not force:
+            return
         self._callbacks.printOutput("MCP: " + msg)
         try:
             def update():
                 current = self.logs_area.getText()
                 new_text = current + msg + "\n"
                 lines = new_text.split('\n')
-                if len(lines) > 5000:
-                    lines = lines[-5000:]
+                if len(lines) > self.max_log_lines:
+                    lines = lines[-self.max_log_lines:]
                     new_text = '\n'.join(lines)
                 self.logs_area.setText(new_text)
                 self.logs_area.setCaretPosition(len(self.logs_area.getText()))
@@ -1171,3 +1288,394 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
             else:
                 self._update_status("No prompts", "info")
         self._send_request_async("prompts/list", {}, handle)
+
+    # =============================================
+    # Virtual Proxy Tab - Bridge MCP to Repeater/Intruder
+    # =============================================
+    
+    def _create_proxy_tab(self):
+        """Create the Virtual Proxy tab for Repeater/Intruder integration"""
+        panel = JPanel(BorderLayout())
+        
+        # Info panel
+        info_panel = JPanel(BorderLayout())
+        info_panel.setBorder(BorderFactory.createTitledBorder("Virtual Proxy for Burp Repeater/Intruder"))
+        
+        info_text = """HOW IT WORKS:
+-----------------------------
+MCP uses asynchronous SSE/WebSocket transport, but Burp's Repeater expects synchronous HTTP.
+The Virtual Proxy bridges this gap:
+
+1. Start the proxy on a local port (e.g., 127.0.0.1:8899)
+2. The proxy receives JSON-RPC requests via HTTP POST
+3. It forwards requests to the MCP server via SSE
+4. Waits for the async response
+5. Returns the response synchronously to Repeater
+
+HOW TO USE:
+-----------------------------
+1. Connect to your MCP server first (main connection)
+2. Click 'Start Proxy' below
+3. In Repeater, send requests to: http://127.0.0.1:PORT/
+4. The request body should be valid JSON-RPC (e.g., tools/call)
+5. Responses will be returned synchronously
+
+TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
+     This will create a request pointing to the virtual proxy."""
+        
+        info_area = JTextArea(info_text)
+        info_area.setEditable(False)
+        info_area.setFont(Font("Monospaced", Font.PLAIN, 12))
+        info_area.setBackground(self.theme_colors["status_bg"])
+        info_panel.add(JScrollPane(info_area), BorderLayout.CENTER)
+        
+        # Control panel
+        control_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        control_panel.setBorder(BorderFactory.createTitledBorder("Proxy Controls"))
+        
+        control_panel.add(JLabel("Port:"))
+        self.proxy_port_field = JTextField("8899", 6)
+        control_panel.add(self.proxy_port_field)
+        
+        self.start_proxy_btn = JButton("Start Proxy", actionPerformed=self._start_proxy)
+        self.start_proxy_btn.setBackground(Color(46, 139, 87))
+        self.start_proxy_btn.setForeground(Color.WHITE)
+        self.start_proxy_btn.setOpaque(True)
+        control_panel.add(self.start_proxy_btn)
+        
+        self.stop_proxy_btn = JButton("Stop Proxy", actionPerformed=self._stop_proxy)
+        self.stop_proxy_btn.setEnabled(False)
+        control_panel.add(self.stop_proxy_btn)
+        
+        self.proxy_status_label = JLabel("Proxy: Stopped")
+        self.proxy_status_label.setFont(Font("SansSerif", Font.BOLD, 12))
+        control_panel.add(self.proxy_status_label)
+        
+        # Proxy log
+        log_panel = JPanel(BorderLayout())
+        log_panel.setBorder(BorderFactory.createTitledBorder("Proxy Log"))
+        self.proxy_log_area = JTextArea(10, 60)
+        self.proxy_log_area.setEditable(False)
+        self.proxy_log_area.setFont(Font("Monospaced", Font.PLAIN, 11))
+        # Set initial placeholder since verbose_logging defaults to False
+        if not self.verbose_logging:
+            self.proxy_log_area.setText("=== LOGGING DISABLED ===\n\nTo save memory, logging is OFF.\n\nTo enable logs:\n- Go to 'Logs' tab\n- Check 'Verbose Logging' checkbox\n\nProxy status is shown above and in the status bar.")
+        log_panel.add(JScrollPane(self.proxy_log_area), BorderLayout.CENTER)
+        
+        # Layout
+        top_panel = JPanel(BorderLayout())
+        top_panel.add(info_panel, BorderLayout.CENTER)
+        top_panel.add(control_panel, BorderLayout.SOUTH)
+        
+        panel.add(top_panel, BorderLayout.NORTH)
+        panel.add(log_panel, BorderLayout.CENTER)
+        
+        # Initialize proxy state
+        self.proxy_server = None
+        self.proxy_running = False
+        
+        return panel
+    
+    def _proxy_log(self, message, force=False):
+        """Log message to proxy log area. Skipped entirely when verbose_logging is False, unless force=True."""
+        if not self.verbose_logging and not force:
+            return
+        def update():
+            try:
+                # Clear placeholder text when force logging (critical messages)
+                current_text = self.proxy_log_area.getText()
+                if force and "=== LOGGING DISABLED ===" in current_text:
+                    self.proxy_log_area.setText("")
+                self.proxy_log_area.append(time.strftime("[%H:%M:%S] ") + message + "\n")
+                # Limit proxy log size
+                text = self.proxy_log_area.getText()
+                lines = text.split('\n')
+                if len(lines) > self.max_log_lines:
+                    self.proxy_log_area.setText('\n'.join(lines[-self.max_log_lines:]))
+                self.proxy_log_area.setCaretPosition(self.proxy_log_area.getDocument().getLength())
+            except Exception as e:
+                self._callbacks.printOutput("MCP: Proxy log error: %s" % str(e))
+        SwingUtilities.invokeLater(update)
+    
+    def _start_proxy(self, event):
+        """Start the virtual proxy server"""
+        self._callbacks.printOutput("MCP: _start_proxy called")
+        
+        if self.proxy_running:
+            self._callbacks.printOutput("MCP: Proxy already running, returning")
+            return
+        
+        if not self.session_id:
+            self._callbacks.printOutput("MCP: No session_id, showing dialog")
+            JOptionPane.showMessageDialog(self.panel, 
+                "Please connect to an MCP server first before starting the proxy.",
+                "Not Connected", JOptionPane.WARNING_MESSAGE)
+            return
+        
+        try:
+            port = int(self.proxy_port_field.getText())
+            self._callbacks.printOutput("MCP: Using port %d" % port)
+        except:
+            JOptionPane.showMessageDialog(self.panel, "Invalid port number", 
+                "Error", JOptionPane.ERROR_MESSAGE)
+            return
+        
+        def run_proxy():
+            from java.net import ServerSocket, InetAddress, InetSocketAddress
+            from java.io import BufferedReader, InputStreamReader, PrintWriter
+            
+            self._callbacks.printOutput("MCP: run_proxy thread started")
+            
+            try:
+                # Close any existing server first
+                if self.proxy_server:
+                    try:
+                        self._callbacks.printOutput("MCP: Closing existing server socket")
+                        self.proxy_server.close()
+                    except:
+                        pass
+                    self.proxy_server = None
+                
+                self._callbacks.printOutput("MCP: Creating ServerSocket on port %d" % port)
+                self.proxy_server = ServerSocket()
+                self.proxy_server.setReuseAddress(True)  # Allow immediate rebind
+                self.proxy_server.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 50)
+                self.proxy_running = True
+                self._callbacks.printOutput("MCP: ServerSocket created, proxy_running = True")
+                
+                def update_ui():
+                    self._callbacks.printOutput("MCP: update_ui called")
+                    try:
+                        self.start_proxy_btn.setEnabled(False)
+                        self.stop_proxy_btn.setEnabled(True)
+                        self.proxy_status_label.setText("Proxy: Running on 127.0.0.1:%d" % port)
+                        self.proxy_status_label.setForeground(Color(0, 128, 0))
+                        # Show and update persistent proxy indicator
+                        self.proxy_indicator.setText("  PROXY: ON (:%d)  " % port)
+                        self.proxy_indicator.setVisible(True)
+                        self._callbacks.printOutput("MCP: UI updated successfully")
+                    except Exception as e:
+                        self._callbacks.printOutput("MCP: update_ui error: %s" % str(e))
+                SwingUtilities.invokeLater(update_ui)
+                
+                # Force these critical messages to always show
+                self._proxy_log("Proxy started on 127.0.0.1:%d" % port, force=True)
+                self._proxy_log("Send JSON-RPC requests to: http://127.0.0.1:%d/" % port, force=True)
+                
+                self._callbacks.printOutput("MCP: Entering accept loop")
+                while self.proxy_running:
+                    try:
+                        client = self.proxy_server.accept()
+                        handler_thread = threading.Thread(target=self._handle_proxy_request, args=(client,))
+                        handler_thread.setDaemon(True)
+                        handler_thread.start()
+                    except Exception as e:
+                        if self.proxy_running:
+                            self._proxy_log("Accept error: %s" % str(e))
+                        break
+                        
+            except Exception as e:
+                self._callbacks.printOutput("MCP: run_proxy exception: %s" % str(e))
+                self._proxy_log("Failed to start proxy: %s" % str(e), force=True)
+                self.proxy_running = False
+        
+        self._callbacks.printOutput("MCP: Starting proxy thread")
+        t = threading.Thread(target=run_proxy)
+        t.setDaemon(True)
+        t.start()
+        self._callbacks.printOutput("MCP: Proxy thread started")
+    
+    def _handle_proxy_request(self, client):
+        """Handle an incoming proxy request"""
+        from java.io import BufferedReader, InputStreamReader, PrintWriter, BufferedOutputStream
+        
+        try:
+            reader = BufferedReader(InputStreamReader(client.getInputStream()))
+            out = BufferedOutputStream(client.getOutputStream())
+            
+            # Read HTTP request
+            request_line = reader.readLine()
+            if not request_line:
+                client.close()
+                return
+            
+            self._proxy_log("Request: %s" % request_line)
+            
+            # Read headers
+            headers = {}
+            content_length = 0
+            while True:
+                line = reader.readLine()
+                if not line or line.strip() == "":
+                    break
+                if ":" in line:
+                    key, val = line.split(":", 1)
+                    headers[key.strip().lower()] = val.strip()
+                    if key.strip().lower() == "content-length":
+                        content_length = int(val.strip())
+            
+            # Read body
+            body = ""
+            if content_length > 0:
+                chars = []
+                for i in range(content_length):
+                    c = reader.read()
+                    if c == -1:
+                        break
+                    chars.append(chr(c))
+                body = "".join(chars)
+            
+            if not body:
+                self._send_proxy_response(out, 400, {"error": "No JSON-RPC body"})
+                client.close()
+                return
+            
+            try:
+                request_json = json.loads(body)
+            except:
+                self._send_proxy_response(out, 400, {"error": "Invalid JSON"})
+                client.close()
+                return
+            
+            self._proxy_log("JSON-RPC: method=%s id=%s" % (
+                request_json.get("method", "?"), request_json.get("id", "?")))
+            
+            # Forward to MCP and wait for response
+            response_holder = {"response": None, "done": False}
+            
+            def on_response(resp):
+                response_holder["response"] = resp
+                response_holder["done"] = True
+            
+            self._send_request_async(
+                request_json.get("method"),
+                request_json.get("params", {}),
+                on_response,
+                timeout=self.request_timeout,
+                req_id=request_json.get("id", "proxy_req_%d" % int(time.time() * 1000))
+            )
+            
+            # Wait for response (with timeout)
+            start = time.time()
+            while not response_holder["done"] and time.time() - start < self.request_timeout:
+                time.sleep(0.1)
+            
+            if response_holder["response"]:
+                self._proxy_log("Response received for id=%s" % request_json.get("id", "?"))
+                self._send_proxy_response(out, 200, response_holder["response"])
+            else:
+                self._proxy_log("Timeout for request id=%s" % request_json.get("id", "?"))
+                self._send_proxy_response(out, 504, {
+                    "jsonrpc": "2.0",
+                    "id": request_json.get("id"),
+                    "error": {"code": -32000, "message": "MCP request timeout"}
+                })
+            
+            client.close()
+            
+        except Exception as e:
+            self._proxy_log("Handler error: %s" % str(e))
+            try:
+                client.close()
+            except:
+                pass
+    
+    def _send_proxy_response(self, out, status_code, response_body):
+        """Send HTTP response back to Repeater"""
+        body_json = json.dumps(response_body, indent=2)
+        body_bytes = body_json.encode("utf-8")
+        
+        status_text = {200: "OK", 400: "Bad Request", 504: "Gateway Timeout"}.get(status_code, "Error")
+        
+        response = "HTTP/1.1 %d %s\r\n" % (status_code, status_text)
+        response += "Content-Type: application/json\r\n"
+        response += "Content-Length: %d\r\n" % len(body_bytes)
+        response += "Connection: close\r\n"
+        response += "\r\n"
+        
+        out.write(response.encode("utf-8"))
+        out.write(body_bytes)
+        out.flush()
+    
+    def _stop_proxy(self, event):
+        """Stop the virtual proxy server"""
+        self.proxy_running = False
+        if self.proxy_server:
+            try:
+                self.proxy_server.close()
+            except:
+                pass
+            self.proxy_server = None
+        
+        def update_ui():
+            self.start_proxy_btn.setEnabled(True)
+            self.stop_proxy_btn.setEnabled(False)
+            self.proxy_status_label.setText("Proxy: Stopped")
+            self.proxy_status_label.setForeground(Color.GRAY)
+            # Hide proxy indicator
+            self.proxy_indicator.setVisible(False)
+        SwingUtilities.invokeLater(update_ui)
+        
+        self._proxy_log("Proxy stopped", force=True)
+
+    # =============================================
+    # Send to Repeater (Context Menu Integration)
+    # =============================================
+    
+    def _send_to_repeater(self, tool_name):
+        """Send a tool call to Burp Repeater via Virtual Proxy"""
+        tool = next((t for t in self.tools if t["name"] == tool_name), None)
+        if not tool:
+            return
+        
+        # Auto-start proxy if not running
+        if not self.proxy_running and self.session_id:
+            self._log("Auto-starting Virtual Proxy for Repeater...")
+            self._start_proxy(None)
+            time.sleep(0.5)  # Give proxy time to start
+        
+        schema = tool.get("inputSchema", {})
+        args = self._generate_sample_args(schema)
+        
+        request = {
+            "jsonrpc": "2.0",
+            "id": "repeater_%d" % int(time.time() * 1000),
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": args
+            }
+        }
+        
+        request_json = json.dumps(request, indent=2)
+        
+        # Use Virtual Proxy for synchronous bridging
+        try:
+            proxy_port = 8899
+            try:
+                proxy_port = int(self.proxy_port_field.getText())
+            except:
+                pass
+            
+            # Create HTTP request for Virtual Proxy (localhost)
+            http_request = "POST / HTTP/1.1\r\n"
+            http_request += "Host: 127.0.0.1:%d\r\n" % proxy_port
+            http_request += "Content-Type: application/json\r\n"
+            http_request += "Accept: application/json\r\n"
+            http_request += "Content-Length: %d\r\n" % len(request_json)
+            http_request += "\r\n"
+            http_request += request_json
+            
+            # Send to Repeater targeting the Virtual Proxy
+            self._callbacks.sendToRepeater(
+                "127.0.0.1", proxy_port, False,
+                self._helpers.stringToBytes(http_request),
+                "MCP: " + tool_name
+            )
+            
+            self._log("Sent tool '%s' to Repeater via proxy" % tool_name)
+            self._update_status("Sent to Repeater: " + tool_name, "success")
+            
+        except Exception as e:
+            self._log("Error sending to Repeater: %s" % str(e))
+
