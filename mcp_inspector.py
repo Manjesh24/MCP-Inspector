@@ -3,7 +3,7 @@
 # Author : Manjesh S
 # Enhanced with WebSocket and Security Testing Features
 
-from burp import IBurpExtender, ITab, IMessageEditorController
+from burp import IBurpExtender, ITab, IMessageEditorController, IExtensionStateListener
 from javax.swing import (JPanel, JButton, JTextField, JLabel,
                          JScrollPane, JTable, JOptionPane, JTextArea,
                          JTabbedPane, JCheckBox, JSpinner, SpinnerNumberModel, 
@@ -21,13 +21,6 @@ import re
 import time
 import os
 
-from java.net.http import HttpClient, HttpRequest, HttpResponse
-from java.net import URI
-from java.time import Duration
-from java.nio.charset import StandardCharsets
-from java.io import BufferedReader, InputStreamReader
-from java.net import URL
-
 # WebSocket imports for dual transport support
 try:
     from java.net.http import WebSocket
@@ -38,7 +31,7 @@ except:
 
 
 
-class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
+class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStateListener):
     """MCP Inspector v2.0 - Ultimate MCP Security Testing Extension"""
     
     VERSION = "2.0"
@@ -56,6 +49,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         self.ws_running = False
         self.websocket = None
         self.pending_requests = {}
+        self._lock = threading.Lock()  # Thread-safe access to shared mutable state
         self.sse_endpoint = None
         self.custom_headers = {}
         self.last_progress_time = {}
@@ -79,16 +73,69 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         self._callbacks = callbacks
         self._helpers   = callbacks.getHelpers()
         callbacks.setExtensionName("MCP Inspector v" + self.VERSION)
+        callbacks.registerExtensionStateListener(self)
         self._init_ui()
         callbacks.addSuiteTab(self)
-
-        self.http_client = HttpClient.newBuilder() \
-            .version(HttpClient.Version.HTTP_2) \
-            .connectTimeout(Duration.ofSeconds(30)) \
-            .build()
         
         self._log("MCP Inspector v%s loaded successfully" % self.VERSION)
         self._log("WebSocket support: %s" % ("Available" if WEBSOCKET_AVAILABLE else "Not available"))
+
+    def extensionUnloaded(self):
+        """Called by Burp when the extension is unloaded - clean up all resources"""
+        self._callbacks.printOutput("MCP Inspector: Unloading extension, cleaning up...")
+        
+        # Stop SSE listener thread
+        self.sse_running = False
+        if self.sse_thread and self.sse_thread.is_alive():
+            self.sse_thread.join(2)
+        
+        # Stop proxy server
+        self.proxy_running = False
+        if hasattr(self, 'proxy_server') and self.proxy_server:
+            try:
+                self.proxy_server.close()
+            except:
+                pass
+            self.proxy_server = None
+        
+        # Clear shared state under lock
+        with self._lock:
+            self.pending_requests.clear()
+            self.last_progress_time.clear()
+        
+        self._callbacks.printOutput("MCP Inspector: Extension unloaded successfully")
+
+    def _parse_url(self, url):
+        """Parse a URL string into (is_https, host, port, path) for Burp's makeHttpRequest"""
+        is_https = url.lower().startswith("https://")
+        scheme_end = url.find("://")
+        if scheme_end >= 0:
+            rest = url[scheme_end + 3:]
+        else:
+            rest = url
+        
+        # Split host and path
+        slash_pos = rest.find("/")
+        if slash_pos >= 0:
+            host_port = rest[:slash_pos]
+            path = rest[slash_pos:]
+        else:
+            host_port = rest
+            path = "/"
+        
+        # Split host and port
+        if ":" in host_port:
+            parts = host_port.rsplit(":", 1)
+            host = parts[0]
+            try:
+                port = int(parts[1])
+            except:
+                port = 443 if is_https else 80
+        else:
+            host = host_port
+            port = 443 if is_https else 80
+        
+        return is_https, host, port, path
 
     def _get_theme_colors(self):
         """Detect theme and return appropriate colors"""
@@ -988,31 +1035,49 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         
         def sse_listener():
             sse_url = self.sse_endpoint if self.sse_endpoint else self.url_field.getText().strip()
-            self._log("Starting SSE: %s" % sse_url)
+            self._log("Starting SSE polling: %s" % sse_url)
             retry_count = 0
-            while self.sse_running and retry_count < 2:
+            while self.sse_running and retry_count < 5:
                 try:
-                    conn = URL(sse_url).openConnection()
-                    conn.setRequestMethod("GET")
-                    conn.setRequestProperty("Accept", "text/event-stream")
-                    if self.session_id:
-                        conn.setRequestProperty("Mcp-Session-Id", self.session_id)
-                    for k, v in self.custom_headers.items():
-                        conn.setRequestProperty(k, v)
-                    conn.setConnectTimeout(10000)
-                    conn.setReadTimeout(0)
-                    conn.connect()
+                    is_https, host, port, path = self._parse_url(sse_url)
                     
-                    status = conn.getResponseCode()
+                    # Build GET request for SSE
+                    http_request = "GET %s HTTP/1.1\r\n" % path
+                    http_request += "Host: %s:%d\r\n" % (host, port)
+                    http_request += "Accept: text/event-stream\r\n"
+                    if self.session_id:
+                        http_request += "Mcp-Session-Id: %s\r\n" % self.session_id
+                    for k, v in self.custom_headers.items():
+                        http_request += "%s: %s\r\n" % (k, v)
+                    http_request += "Connection: close\r\n"
+                    http_request += "\r\n"
+                    
+                    http_service = self._helpers.buildHttpService(host, port, is_https)
+                    response = self._callbacks.makeHttpRequest(http_service,
+                        self._helpers.stringToBytes(http_request))
+                    
+                    if response is None:
+                        retry_count += 1
+                        time.sleep(2)
+                        continue
+                    
+                    resp_bytes = response.getResponse() if hasattr(response, 'getResponse') else response
+                    if resp_bytes is None:
+                        retry_count += 1
+                        time.sleep(2)
+                        continue
+                    
+                    resp_info = self._helpers.analyzeResponse(resp_bytes)
+                    status = resp_info.getStatusCode()
+                    body_offset = resp_info.getBodyOffset()
+                    body = self._helpers.bytesToString(resp_bytes[body_offset:])
+                    
                     if status == 200:
-                        reader = BufferedReader(InputStreamReader(conn.getInputStream(), "UTF-8"))
                         retry_count = 0
+                        # Parse SSE events from the response body
                         event_type = None
                         event_data = []
-                        while self.sse_running:
-                            line = reader.readLine()
-                            if line is None:
-                                break
+                        for line in body.split('\n'):
                             line = line.strip()
                             if not line:
                                 if event_data:
@@ -1026,13 +1091,21 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
                                 data = line[5:].strip()
                                 if data and data != "ping":
                                     event_data.append(data)
-                        reader.close()
+                        # Process any remaining event data
+                        if event_data:
+                            self._process_sse_event(event_type, event_data)
+                        
+                        # Short delay before next poll
+                        if self.sse_running:
+                            time.sleep(1)
                     elif status == 405:
+                        self._log("SSE endpoint returned 405, stopping SSE polling")
                         break
                     else:
                         retry_count += 1
                         time.sleep(2)
-                except:
+                except Exception as e:
+                    self._log("SSE poll error: %s" % str(e))
                     retry_count += 1
                     time.sleep(2)
             self.sse_running = False
@@ -1055,19 +1128,21 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
             if event_type == "progress":
                 parsed = json.loads(data_str)
                 if "id" in parsed:
-                    self.last_progress_time[parsed["id"]] = time.time()
+                    with self._lock:
+                        self.last_progress_time[parsed["id"]] = time.time()
                 return
             parsed = json.loads(data_str)
             if "jsonrpc" in parsed and "id" in parsed:
                 req_id = parsed["id"]
-                if req_id in self.pending_requests:
-                    callback = self.pending_requests[req_id]
-                    del self.pending_requests[req_id]
+                with self._lock:
+                    callback = self.pending_requests.pop(req_id, None)
+                if callback:
                     callback(parsed)
         except:
             pass
 
     def _on_connect_click(self, event):
+        """Handle Connect button click - all blocking work runs off the EDT"""
         if self.initializing:
             return
         url = self.url_field.getText().strip()
@@ -1075,18 +1150,21 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
             self._update_status("Enter endpoint URL", "error")
             return
         
-        # Auto-disconnect previous connection if endpoint changed
-        if self.session_id:
-            self._log("Disconnecting previous endpoint before connecting to new one...")
-            self._disconnect_internal()
-            time.sleep(0.5)  # Brief pause to ensure clean disconnect
-        
         self.initializing = True
         self.connect_btn.setEnabled(False)
         self._update_status("Connecting...", "working")
+        
+        # Capture whether we need to disconnect first
+        needs_disconnect = self.session_id is not None
 
         def init():
             try:
+                # Auto-disconnect previous connection (runs in background thread)
+                if needs_disconnect:
+                    self._log("Disconnecting previous endpoint before connecting to new one...")
+                    self._disconnect_internal()
+                    time.sleep(0.5)  # Brief pause to ensure clean disconnect
+                
                 resp = self._send_request_sync("initialize", {
                     "protocolVersion": "2024-11-05",
                     "capabilities": {"roots": {"listChanged": True}, "sampling": {}},
@@ -1121,17 +1199,20 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
                 self._update_status("Error: %s" % str(e), "error")
                 self._log(traceback.format_exc())
             finally:
-                self.connect_btn.setEnabled(True)
+                def restore_btn():
+                    self.connect_btn.setEnabled(True)
+                SwingUtilities.invokeLater(restore_btn)
                 self.initializing = False
                 
         threading.Thread(target=init).start()
 
     def _disconnect_internal(self):
-        """Internal disconnect logic - cleanly closes existing connection"""
+        """Internal disconnect logic - cleanly closes existing connection.
+        NOTE: This method may block (thread.join), so it must only be called from background threads."""
         self._log("Closing SSE connection...")
         self.sse_running = False
-        if self.sse_thread:
-            self.sse_thread.join(timeout=2)
+        if self.sse_thread and self.sse_thread.is_alive():
+            self.sse_thread.join(2)
         
         self._log("Clearing session data...")
         self.session_id = None
@@ -1141,97 +1222,166 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController):
         self.tools = []
         self.resources = []
         self.prompts = []
-        self.pending_requests = {}
-        self.last_progress_time = {}
+        with self._lock:
+            self.pending_requests.clear()
+            self.last_progress_time.clear()
 
     def _on_disconnect_click(self, event):
-        self._disconnect_internal()
+        """Handle Disconnect button click - runs disconnect off the EDT"""
+        def do_disconnect():
+            self._disconnect_internal()
+            
+            def update():
+                self.tools_model.setRowCount(0)
+                self.resources_model.setRowCount(0)
+                self.prompts_model.setRowCount(0)
+                self.disconnect_btn.setEnabled(False)
+            SwingUtilities.invokeLater(update)
+            
+            self._update_status("Disconnected", "info")
+            self._update_server_info()
         
-        def update():
-            self.tools_model.setRowCount(0)
-            self.resources_model.setRowCount(0)
-            self.prompts_model.setRowCount(0)
-            self.disconnect_btn.setEnabled(False)
-        SwingUtilities.invokeLater(update)
-        
-        self._update_status("Disconnected", "info")
-        self._update_server_info()
+        threading.Thread(target=do_disconnect).start()
 
     def _send_request_sync(self, method, params=None, req_id=None):
+        """Send a synchronous JSON-RPC request via Burp's networking stack"""
         if not req_id:
             req_id = "req_%s" % threading.currentThread().ident
         payload = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
         url = self.url_field.getText().strip()
+        
         headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
         headers.update(self.custom_headers)
         if self.session_id:
             headers["Mcp-Session-Id"] = self.session_id
+        
         try:
-            builder = HttpRequest.newBuilder().uri(URI.create(url)).POST(
-                HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8)
-            ).timeout(Duration.ofSeconds(self.request_timeout))
+            is_https, host, port, path = self._parse_url(url)
+            
+            # Build raw HTTP POST request
+            payload_bytes = payload.encode("utf-8")
+            http_request = "POST %s HTTP/1.1\r\n" % path
+            http_request += "Host: %s:%d\r\n" % (host, port)
             for k, v in headers.items():
-                builder.header(k, v)
-            resp = self.http_client.send(builder.build(),
-                     HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
-            sid_opt = resp.headers().firstValue("mcp-session-id")
-            if sid_opt.isPresent() and not self.session_id:
-                self.session_id = sid_opt.get()
-                self._log("Session ID: %s..." % self.session_id[:30])
-            return self._parse_sse_body(resp.body()) or {"error": {"code": -32700, "message": "Parse error"}}
+                http_request += "%s: %s\r\n" % (k, v)
+            http_request += "Content-Length: %d\r\n" % len(payload_bytes)
+            http_request += "Connection: close\r\n"
+            http_request += "\r\n"
+            http_request += payload
+            
+            http_service = self._helpers.buildHttpService(host, port, is_https)
+            response = self._callbacks.makeHttpRequest(http_service,
+                self._helpers.stringToBytes(http_request))
+            
+            resp_bytes = response.getResponse() if hasattr(response, 'getResponse') else response
+            if resp_bytes is None:
+                return {"error": {"code": -1, "message": "No response from server"}}
+            
+            resp_info = self._helpers.analyzeResponse(resp_bytes)
+            body_offset = resp_info.getBodyOffset()
+            body = self._helpers.bytesToString(resp_bytes[body_offset:])
+            
+            # Extract session ID from response headers
+            for header in resp_info.getHeaders():
+                if header.lower().startswith("mcp-session-id:"):
+                    sid = header.split(":", 1)[1].strip()
+                    if not self.session_id:
+                        self.session_id = sid
+                        self._log("Session ID: %s..." % self.session_id[:30])
+                    break
+            
+            return self._parse_sse_body(body) or {"error": {"code": -32700, "message": "Parse error"}}
         except Exception as e:
             return {"error": {"code": -1, "message": str(e)}}
 
     def _send_request_async(self, method, params, callback, timeout=None, req_id=None):
+        """Send an asynchronous JSON-RPC request via Burp's networking stack"""
         if not timeout:
             timeout = self.request_timeout
         if not req_id:
             req_id = "req_%d" % int(time.time() * 1000)
-        self.pending_requests[req_id] = callback
-        self.last_progress_time[req_id] = time.time()
+        
+        with self._lock:
+            self.pending_requests[req_id] = callback
+            self.last_progress_time[req_id] = time.time()
+        
         payload = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
         url = self.url_field.getText().strip()
         
         def req_thread():
             try:
-                builder = HttpRequest.newBuilder().uri(URI.create(url)).POST(
-                    HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8)
-                ).timeout(Duration.ofSeconds(timeout))
-                builder.header("Content-Type", "application/json")
-                builder.header("Accept", "application/json, text/event-stream")
+                is_https, host, port, path = self._parse_url(url)
+                
+                # Build raw HTTP POST request
+                payload_bytes = payload.encode("utf-8")
+                http_request = "POST %s HTTP/1.1\r\n" % path
+                http_request += "Host: %s:%d\r\n" % (host, port)
+                http_request += "Content-Type: application/json\r\n"
+                http_request += "Accept: application/json, text/event-stream\r\n"
                 for k, v in self.custom_headers.items():
-                    builder.header(k, v)
+                    http_request += "%s: %s\r\n" % (k, v)
                 if self.session_id:
-                    builder.header("Mcp-Session-Id", self.session_id)
-                resp = self.http_client.send(builder.build(),
-                         HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8))
-                status = resp.statusCode()
-                body = resp.body()
+                    http_request += "Mcp-Session-Id: %s\r\n" % self.session_id
+                http_request += "Content-Length: %d\r\n" % len(payload_bytes)
+                http_request += "Connection: close\r\n"
+                http_request += "\r\n"
+                http_request += payload
+                
+                http_service = self._helpers.buildHttpService(host, port, is_https)
+                response = self._callbacks.makeHttpRequest(http_service,
+                    self._helpers.stringToBytes(http_request))
+                
+                resp_bytes = response.getResponse() if hasattr(response, 'getResponse') else response
+                if resp_bytes is None:
+                    with self._lock:
+                        self.pending_requests.pop(req_id, None)
+                    callback({"error": {"code": -1, "message": "No response from server"}})
+                    return
+                
+                resp_info = self._helpers.analyzeResponse(resp_bytes)
+                status = resp_info.getStatusCode()
+                body_offset = resp_info.getBodyOffset()
+                body = self._helpers.bytesToString(resp_bytes[body_offset:])
+                
+                # Extract session ID from response headers
+                for header in resp_info.getHeaders():
+                    if header.lower().startswith("mcp-session-id:"):
+                        sid = header.split(":", 1)[1].strip()
+                        if not self.session_id:
+                            self.session_id = sid
+                        break
+                
                 if status == 202:
+                    # Async response — wait for SSE to deliver the result
                     def monitor():
                         start = time.time()
-                        while req_id in self.pending_requests:
+                        while True:
+                            with self._lock:
+                                still_pending = req_id in self.pending_requests
+                            if not still_pending:
+                                break
                             if time.time() - start > self.max_total_timeout:
                                 break
                             time.sleep(1)
-                        if req_id in self.pending_requests:
-                            del self.pending_requests[req_id]
-                            callback({"error": {"code": -32000, "message": "Timeout"}})
+                        with self._lock:
+                            cb = self.pending_requests.pop(req_id, None)
+                        if cb:
+                            cb({"error": {"code": -32000, "message": "Timeout"}})
                     t = threading.Thread(target=monitor)
                     t.daemon = True
                     t.start()
                 elif status == 200:
-                    if req_id in self.pending_requests:
-                        del self.pending_requests[req_id]
+                    with self._lock:
+                        self.pending_requests.pop(req_id, None)
                     parsed = self._parse_sse_body(body)
                     callback(parsed if parsed else {"error": {"code": -32700, "message": "Parse error"}})
                 else:
-                    if req_id in self.pending_requests:
-                        del self.pending_requests[req_id]
+                    with self._lock:
+                        self.pending_requests.pop(req_id, None)
                     callback({"error": {"code": status, "message": body[:200]}})
             except Exception as e:
-                if req_id in self.pending_requests:
-                    del self.pending_requests[req_id]
+                with self._lock:
+                    self.pending_requests.pop(req_id, None)
                 callback({"error": {"code": -1, "message": str(e)}})
         t = threading.Thread(target=req_thread)
         t.daemon = True
@@ -1623,16 +1773,11 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
     # =============================================
     
     def _send_to_repeater(self, tool_name):
-        """Send a tool call to Burp Repeater via Virtual Proxy"""
+        """Send a tool call to Burp Repeater via Virtual Proxy.
+        Runs blocking proxy auto-start off the EDT."""
         tool = next((t for t in self.tools if t["name"] == tool_name), None)
         if not tool:
             return
-        
-        # Auto-start proxy if not running
-        if not self.proxy_running and self.session_id:
-            self._log("Auto-starting Virtual Proxy for Repeater...")
-            self._start_proxy(None)
-            time.sleep(0.5)  # Give proxy time to start
         
         schema = tool.get("inputSchema", {})
         args = self._generate_sample_args(schema)
@@ -1649,33 +1794,41 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
         
         request_json = json.dumps(request, indent=2)
         
-        # Use Virtual Proxy for synchronous bridging
+        proxy_port = 8899
         try:
-            proxy_port = 8899
+            proxy_port = int(self.proxy_port_field.getText())
+        except:
+            pass
+        
+        def do_send():
             try:
-                proxy_port = int(self.proxy_port_field.getText())
-            except:
-                pass
-            
-            # Create HTTP request for Virtual Proxy (localhost)
-            http_request = "POST / HTTP/1.1\r\n"
-            http_request += "Host: 127.0.0.1:%d\r\n" % proxy_port
-            http_request += "Content-Type: application/json\r\n"
-            http_request += "Accept: application/json\r\n"
-            http_request += "Content-Length: %d\r\n" % len(request_json)
-            http_request += "\r\n"
-            http_request += request_json
-            
-            # Send to Repeater targeting the Virtual Proxy
-            self._callbacks.sendToRepeater(
-                "127.0.0.1", proxy_port, False,
-                self._helpers.stringToBytes(http_request),
-                "MCP: " + tool_name
-            )
-            
-            self._log("Sent tool '%s' to Repeater via proxy" % tool_name)
-            self._update_status("Sent to Repeater: " + tool_name, "success")
-            
-        except Exception as e:
-            self._log("Error sending to Repeater: %s" % str(e))
+                # Auto-start proxy if not running (blocking, runs in background thread)
+                if not self.proxy_running and self.session_id:
+                    self._log("Auto-starting Virtual Proxy for Repeater...")
+                    self._start_proxy(None)
+                    time.sleep(0.5)  # Give proxy time to start
+                
+                # Create HTTP request for Virtual Proxy (localhost)
+                http_request = "POST / HTTP/1.1\r\n"
+                http_request += "Host: 127.0.0.1:%d\r\n" % proxy_port
+                http_request += "Content-Type: application/json\r\n"
+                http_request += "Accept: application/json\r\n"
+                http_request += "Content-Length: %d\r\n" % len(request_json)
+                http_request += "\r\n"
+                http_request += request_json
+                
+                # Send to Repeater targeting the Virtual Proxy
+                self._callbacks.sendToRepeater(
+                    "127.0.0.1", proxy_port, False,
+                    self._helpers.stringToBytes(http_request),
+                    "MCP: " + tool_name
+                )
+                
+                self._log("Sent tool '%s' to Repeater via proxy" % tool_name)
+                self._update_status("Sent to Repeater: " + tool_name, "success")
+                
+            except Exception as e:
+                self._log("Error sending to Repeater: %s" % str(e))
+        
+        threading.Thread(target=do_send).start()
 
