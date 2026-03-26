@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
-# MCP Inspector v2.0 - Ultimate MCP Security Testing Extension
-# Author : Manjesh S
-# Enhanced with WebSocket and Security Testing Features
+# MCP Inspector - Burp Suite extension for MCP security testing
+# Author: Manjesh S
 
 from burp import IBurpExtender, ITab, IMessageEditorController, IExtensionStateListener
 from javax.swing import (JPanel, JButton, JTextField, JLabel,
                          JScrollPane, JTable, JOptionPane, JTextArea,
                          JTabbedPane, JCheckBox, JSpinner, SpinnerNumberModel, 
-                         BorderFactory, JSplitPane, JComboBox, DefaultComboBoxModel,
-                         SwingUtilities, JPopupMenu, JMenuItem, Box, UIManager,
-                         JProgressBar, JTree, ButtonGroup, JRadioButton)
-from javax.swing.tree import DefaultMutableTreeNode, DefaultTreeModel
-from java.awt import BorderLayout, Dimension, FlowLayout, GridLayout, Font, Color, GridBagLayout, GridBagConstraints, Insets, Cursor
+                         BorderFactory, JSplitPane, JComboBox,
+                         SwingUtilities, JPopupMenu, JMenuItem, Box, UIManager)
+from java.awt import BorderLayout, FlowLayout, Font, Color, GridBagLayout, GridBagConstraints, Insets, Cursor
 from javax.swing.table import DefaultTableModel
 from java.awt.event import MouseAdapter
 import json
@@ -19,22 +16,10 @@ import threading
 import traceback
 import re
 import time
-import os
-
-# WebSocket imports for dual transport support
-try:
-    from java.net.http import WebSocket
-    WEBSOCKET_AVAILABLE = True
-except:
-    WEBSOCKET_AVAILABLE = False
-
-
-
 
 class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStateListener):
-    """MCP Inspector v2.0 - Ultimate MCP Security Testing Extension"""
     
-    VERSION = "2.0"
+    VERSION = "2.1"
     
     def __init__(self):
         self.session_id = None
@@ -46,22 +31,17 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         self.protocol_version = None
         self.sse_thread = None
         self.sse_running = False
-        self.ws_running = False
-        self.websocket = None
         self.pending_requests = {}
-        self._lock = threading.Lock()  # Thread-safe access to shared mutable state
+        self._lock = threading.Lock()
         self.sse_endpoint = None
         self.custom_headers = {}
         self.last_progress_time = {}
         self.request_history = []
         self.history_index = -1
         
-        # Transport settings
-        self.transport_type = "SSE"  # SSE, WebSocket, or Auto
-        
-        # Logging settings
-        self.verbose_logging = False  # Disable verbose logs for high-throughput (Intruder)
-        self.max_log_lines = 1000  # Reduced for performance
+        self.verbose_logging = False
+        self.max_log_lines = 1000
+        self._log_line_count = 0
         
         # Settings
         self.request_timeout = 30
@@ -69,7 +49,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         self.max_total_timeout = 300
 
     def registerExtenderCallbacks(self, callbacks):
-        """Extender API entry point"""
         self._callbacks = callbacks
         self._helpers   = callbacks.getHelpers()
         callbacks.setExtensionName("MCP Inspector v" + self.VERSION)
@@ -78,18 +57,14 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         callbacks.addSuiteTab(self)
         
         self._log("MCP Inspector v%s loaded successfully" % self.VERSION)
-        self._log("WebSocket support: %s" % ("Available" if WEBSOCKET_AVAILABLE else "Not available"))
 
     def extensionUnloaded(self):
-        """Called by Burp when the extension is unloaded - clean up all resources"""
         self._callbacks.printOutput("MCP Inspector: Unloading extension, cleaning up...")
-        
-        # Stop SSE listener thread
+
         self.sse_running = False
         if self.sse_thread and self.sse_thread.is_alive():
             self.sse_thread.join(2)
-        
-        # Stop proxy server
+
         self.proxy_running = False
         if hasattr(self, 'proxy_server') and self.proxy_server:
             try:
@@ -97,8 +72,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             except:
                 pass
             self.proxy_server = None
-        
-        # Clear shared state under lock
+
         with self._lock:
             self.pending_requests.clear()
             self.last_progress_time.clear()
@@ -106,15 +80,13 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         self._callbacks.printOutput("MCP Inspector: Extension unloaded successfully")
 
     def _parse_url(self, url):
-        """Parse a URL string into (is_https, host, port, path) for Burp's makeHttpRequest"""
         is_https = url.lower().startswith("https://")
         scheme_end = url.find("://")
         if scheme_end >= 0:
             rest = url[scheme_end + 3:]
         else:
             rest = url
-        
-        # Split host and path
+
         slash_pos = rest.find("/")
         if slash_pos >= 0:
             host_port = rest[:slash_pos]
@@ -122,8 +94,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         else:
             host_port = rest
             path = "/"
-        
-        # Split host and port
+
         if ":" in host_port:
             parts = host_port.rsplit(":", 1)
             host = parts[0]
@@ -137,8 +108,12 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         
         return is_https, host, port, path
 
+    def _get_error_message(self, error):
+        if isinstance(error, dict):
+            return error.get("message", str(error))
+        return str(error)
+
     def _get_theme_colors(self):
-        """Detect theme and return appropriate colors"""
         bg = UIManager.getColor("Panel.background")
         if bg:
             brightness = (bg.getRed() * 299 + bg.getGreen() * 587 + bg.getBlue() * 114) / 1000
@@ -177,16 +152,10 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         self.panel = JPanel(BorderLayout())
         self.theme_colors = self._get_theme_colors()
 
-        # Top connection panel
         top_panel = JPanel(BorderLayout())
-        
-        # Connection controls - first row
+
         conn_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         self.url_field = JTextField("https://localhost/mcp", 35)
-        
-        # Transport selector
-        self.transport_combo = JComboBox(["Auto", "SSE", "WebSocket"])
-        self.transport_combo.setToolTipText("Select transport type (Auto will detect)")
         
         self.connect_btn = JButton("Connect", actionPerformed=self._on_connect_click)
         self.connect_btn.setBackground(Color(46, 139, 87))
@@ -198,25 +167,20 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         
         conn_panel.add(JLabel("Endpoint:"))
         conn_panel.add(self.url_field)
-        conn_panel.add(JLabel("Transport:"))
-        conn_panel.add(self.transport_combo)
         conn_panel.add(self.connect_btn)
         conn_panel.add(self.disconnect_btn)
-        
-        # Second row - Settings
+
         settings_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         self.headers_btn = JButton("Headers", actionPerformed=self._edit_headers)
         self.settings_btn = JButton("Settings", actionPerformed=self._edit_settings)
         
         settings_panel.add(self.headers_btn)
         settings_panel.add(self.settings_btn)
-        
-        # Connection panel wrapper
+
         conn_wrapper = JPanel(BorderLayout())
         conn_wrapper.add(conn_panel, BorderLayout.NORTH)
         conn_wrapper.add(settings_panel, BorderLayout.SOUTH)
-        
-        # Prominent status bar
+
         status_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         self.status_label = JLabel("Ready - Configure endpoint and click Connect")
         self.status_label.setFont(Font("SansSerif", Font.BOLD, 14))
@@ -227,8 +191,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         self.status_indicator.setBackground(self.theme_colors["indicator_ready"])
         status_panel.add(self.status_indicator)
         status_panel.add(self.status_label)
-        
-        # Persistent proxy indicator (hidden when OFF, clickable when ON)
+
         status_panel.add(JLabel("    "))  # Spacer
         self.proxy_indicator = JLabel("  PROXY: ON  ")
         self.proxy_indicator.setFont(Font("SansSerif", Font.BOLD, 12))
@@ -239,17 +202,15 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         self.proxy_indicator.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR))
         self.proxy_indicator.setToolTipText("Click to go to Virtual Proxy tab")
         self.proxy_indicator.setVisible(False)  # Hidden by default
-        
-        # Store reference to main_tabs for navigation (will be set after tabs are created)
+
         self.main_tabs = None
-        
-        # Add click listener
+
         class ProxyClickListener(MouseAdapter):
             def __init__(self, extender):
                 self.extender = extender
             def mouseClicked(self, event):
                 if self.extender.main_tabs:
-                    # Find and switch to Virtual Proxy tab (index 4)
+
                     self.extender.main_tabs.setSelectedIndex(4)
         self.proxy_indicator.addMouseListener(ProxyClickListener(self))
         status_panel.add(self.proxy_indicator)
@@ -261,7 +222,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         top_panel.add(status_panel, BorderLayout.SOUTH)
         self.panel.add(top_panel, BorderLayout.NORTH)
 
-        # Main tabs
         main_tabs = JTabbedPane()
 
         tools_panel = self._create_tools_tab()
@@ -276,7 +236,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         prompts_panel = self._create_prompts_tab()
         main_tabs.addTab("Prompts", prompts_panel)
 
-        # Virtual Proxy tab for Repeater/Intruder integration
         proxy_panel = self._create_proxy_tab()
         main_tabs.addTab("Virtual Proxy", proxy_panel)
 
@@ -286,9 +245,8 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         logs_panel = self._create_logs_tab()
         main_tabs.addTab("Logs", logs_panel)
 
-        self.main_tabs = main_tabs  # Store reference for proxy indicator click
+        self.main_tabs = main_tabs
         self.panel.add(main_tabs, BorderLayout.CENTER)
-
 
     def _create_tools_tab(self):
         panel = JPanel(BorderLayout())
@@ -328,8 +286,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                     send_item = JMenuItem("Send to Request Editor")
                     send_item.addActionListener(lambda e: self.extender._send_tool_to_editor(tool_name))
                     popup.add(send_item)
-                    
-                    # NEW: Send to Repeater option
+
                     repeater_item = JMenuItem("Send to Repeater")
                     repeater_item.addActionListener(lambda e: self.extender._send_to_repeater(tool_name))
                     popup.add(repeater_item)
@@ -350,8 +307,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
 
     def _create_editor_tab(self):
         panel = JPanel(BorderLayout())
-        
-        # Top controls
+
         top = JPanel(FlowLayout(FlowLayout.LEFT))
         
         self.history_back_btn = JButton("<", actionPerformed=self._history_back)
@@ -398,8 +354,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         split = JSplitPane(JSplitPane.HORIZONTAL_SPLIT)
         split.setDividerLocation(500)
         split.setResizeWeight(0.5)
-        
-        # Request panel
+
         req_panel = JPanel(BorderLayout())
         req_panel.setBorder(BorderFactory.createTitledBorder("Request (JSON-RPC)"))
         self.request_editor = self._callbacks.createMessageEditor(self, True)
@@ -412,8 +367,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             "params": {}
         }, indent=2)
         self.request_editor.setMessage(self._helpers.stringToBytes(initial_request), True)
-        
-        # Response panel
+
         resp_panel = JPanel(BorderLayout())
         resp_panel.setBorder(BorderFactory.createTitledBorder("Response"))
         self.response_editor = self._callbacks.createMessageEditor(self, False)
@@ -504,8 +458,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         btn_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         clear_btn = JButton("Clear Logs", actionPerformed=self._clear_logs)
         btn_panel.add(clear_btn)
-        
-        # Verbose logging toggle
+
         self.verbose_checkbox = JCheckBox("Verbose Logging", self.verbose_logging)
         self.verbose_checkbox.addActionListener(lambda e: self._toggle_verbose())
         self.verbose_checkbox.setToolTipText("When disabled, all logging is OFF to save memory and CPU")
@@ -516,7 +469,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         self.logs_area = JTextArea()
         self.logs_area.setEditable(False)
         self.logs_area.setFont(Font("Monospaced", Font.PLAIN, 11))
-        # Set initial placeholder since verbose_logging defaults to False
+
         if not self.verbose_logging:
             self.logs_area.setText("=== LOGGING DISABLED ===\n\nTo save memory, logging is OFF.\n\nTo enable logs:\n- Check 'Verbose Logging' checkbox above\n\nProxy status is shown in the status bar below.")
         logs_scroll = JScrollPane(self.logs_area)
@@ -528,7 +481,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
     
     def _toggle_verbose(self):
         self.verbose_logging = self.verbose_checkbox.isSelected()
-        # Always log toggle messages to extension output
+
         if self.verbose_logging:
             self._callbacks.printOutput("MCP: Verbose logging ENABLED - all logs active")
             self.logs_area.setText("")  # Clear placeholder
@@ -536,7 +489,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             self._log("Verbose logging ENABLED", force=True)
         else:
             self._callbacks.printOutput("MCP: Verbose logging DISABLED - all logs OFF to save memory")
-            # Show placeholder text in log areas
+
             placeholder = "=== LOGGING DISABLED ===\n\nTo save memory, logging is OFF.\n\nTo enable logs:\n1. Go to 'Logs' tab\n2. Check 'Verbose Logging' checkbox\n\nProxy status is shown in the status bar below."
             def update_logs():
                 self.logs_area.setText(placeholder)
@@ -549,7 +502,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
     def getUiComponent(self):  
         return self.panel
 
-    # IMessageEditorController methods
     def getHttpService(self):
         return None
     
@@ -567,7 +519,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         self._log("Copied: %s" % text[:50])
 
     def _prettify_response(self, event):
-        """Extract and prettify nested/escaped JSON from MCP response"""
         try:
             response_bytes = self.response_editor.getMessage()
             if not response_bytes or len(response_bytes) == 0:
@@ -576,8 +527,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                 
             response_text = self._helpers.bytesToString(response_bytes)
             original_length = len(response_text)
-            
-            # Parse outer JSON
+
             try:
                 response_json = json.loads(response_text)
             except Exception as e:
@@ -585,20 +535,16 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                 return
             
             self._log("Processing response for nested JSON...")
-            
-            # Process recursively to unescape nested JSON
+
             prettified = self._deep_unescape_json(response_json)
-            
-            # Format with indentation
+
             pretty_text = json.dumps(prettified, indent=2, ensure_ascii=False)
             new_length = len(pretty_text)
-            
-            # Check if anything actually changed
+
             if pretty_text == response_text:
                 self._log("No escaped JSON found in response")
                 return
-            
-            # Update response editor
+
             self.response_editor.setMessage(self._helpers.stringToBytes(pretty_text), False)
             self._log("Response unescaped successfully (was %d bytes, now %d bytes)" % (original_length, new_length))
             
@@ -607,8 +553,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             self._log(traceback.format_exc())
 
     def _deep_unescape_json(self, obj, depth=0):
-        """Recursively find and parse escaped JSON strings"""
-        # Prevent infinite recursion
         if depth > 10:
             return obj
             
@@ -623,8 +567,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             
         elif isinstance(obj, basestring):
             stripped = obj.strip()
-            
-            # Check for escape sequences that indicate JSON
+
             has_escapes = ('\\n' in stripped or '\\"' in stripped or '\\t' in stripped)
             looks_like_json = (
                 (stripped.startswith('{') and stripped.endswith('}')) or
@@ -633,18 +576,17 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             
             if has_escapes or (looks_like_json and len(stripped) > 10):
                 try:
-                    # Try direct parse first (already unescaped)
+
                     try:
                         parsed = json.loads(stripped)
                         self._log("Found nested JSON (already unescaped) at depth %d" % depth)
                         return self._deep_unescape_json(parsed, depth + 1)
                     except:
                         pass
-                    
-                    # Unescape if needed
+
                     unescaped = stripped
                     if has_escapes:
-                        # Replace common escape sequences
+
                         unescaped = unescaped.replace('\\n', '\n')
                         unescaped = unescaped.replace('\\"', '"')
                         unescaped = unescaped.replace('\\t', '\t')
@@ -652,16 +594,14 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                         unescaped = unescaped.replace('\\/', '/')
                         unescaped = unescaped.replace('\\b', '\b')
                         unescaped = unescaped.replace('\\f', '\f')
-                        # Handle double-escaped backslashes last
+
                         unescaped = unescaped.replace('\\\\', '\\')
                     
-                    # Try to parse the unescaped string
                     parsed = json.loads(unescaped)
                     self._log("Found and unescaped nested JSON at depth %d" % depth)
                     return self._deep_unescape_json(parsed, depth + 1)
                     
-                except (ValueError, TypeError) as e:
-                    # If it fails, return original
+                except (ValueError, TypeError):
                     return obj
             
             return obj
@@ -669,29 +609,27 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             return obj
 
     def _log(self, msg, force=False):
-        """Log message. Skipped entirely when verbose_logging is False, unless force=True."""
         if not self.verbose_logging and not force:
             return
         self._callbacks.printOutput("MCP: " + msg)
         try:
+            self._log_line_count += 1
             def update():
-                current = self.logs_area.getText()
-                new_text = current + msg + "\n"
-                lines = new_text.split('\n')
-                if len(lines) > self.max_log_lines:
-                    lines = lines[-self.max_log_lines:]
-                    new_text = '\n'.join(lines)
-                self.logs_area.setText(new_text)
-                self.logs_area.setCaretPosition(len(self.logs_area.getText()))
+                self.logs_area.append(msg + "\n")
+                if self._log_line_count % 100 == 0:
+                    text = self.logs_area.getText()
+                    lines = text.split('\n')
+                    if len(lines) > self.max_log_lines:
+                        self.logs_area.setText('\n'.join(lines[-self.max_log_lines:]))
+                self.logs_area.setCaretPosition(self.logs_area.getDocument().getLength())
             SwingUtilities.invokeLater(update)
-        except: 
+        except:
             pass
 
     def _clear_logs(self, event):
         self.logs_area.setText("")
 
     def _update_status(self, msg, status_type="info"):
-        """Update status with theme-aware colors"""
         def update():
             self.status_label.setText(msg)
             if status_type == "error":
@@ -1040,8 +978,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             while self.sse_running and retry_count < 5:
                 try:
                     is_https, host, port, path = self._parse_url(sse_url)
-                    
-                    # Build GET request for SSE
+
                     http_request = "GET %s HTTP/1.1\r\n" % path
                     http_request += "Host: %s:%d\r\n" % (host, port)
                     http_request += "Accept: text/event-stream\r\n"
@@ -1074,7 +1011,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                     
                     if status == 200:
                         retry_count = 0
-                        # Parse SSE events from the response body
+
                         event_type = None
                         event_data = []
                         for line in body.split('\n'):
@@ -1091,11 +1028,10 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                                 data = line[5:].strip()
                                 if data and data != "ping":
                                     event_data.append(data)
-                        # Process any remaining event data
+
                         if event_data:
                             self._process_sse_event(event_type, event_data)
-                        
-                        # Short delay before next poll
+
                         if self.sse_running:
                             time.sleep(1)
                     elif status == 405:
@@ -1142,7 +1078,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             pass
 
     def _on_connect_click(self, event):
-        """Handle Connect button click - all blocking work runs off the EDT"""
         if self.initializing:
             return
         url = self.url_field.getText().strip()
@@ -1153,17 +1088,16 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         self.initializing = True
         self.connect_btn.setEnabled(False)
         self._update_status("Connecting...", "working")
-        
-        # Capture whether we need to disconnect first
+
         needs_disconnect = self.session_id is not None
 
         def init():
             try:
-                # Auto-disconnect previous connection (runs in background thread)
+
                 if needs_disconnect:
                     self._log("Disconnecting previous endpoint before connecting to new one...")
                     self._disconnect_internal()
-                    time.sleep(0.5)  # Brief pause to ensure clean disconnect
+                    time.sleep(0.5)
                 
                 resp = self._send_request_sync("initialize", {
                     "protocolVersion": "2024-11-05",
@@ -1186,13 +1120,12 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                     def enable():
                         self.disconnect_btn.setEnabled(True)
                     SwingUtilities.invokeLater(enable)
-                    
-                    # Auto-list tools after successful connection
+
                     time.sleep(0.5)
                     self._list_tools(None)
                     
                 elif resp and "error" in resp:
-                    self._update_status("Error: %s" % resp["error"].get("message"), "error")
+                    self._update_status("Error: %s" % self._get_error_message(resp["error"]), "error")
                 else:
                     self._update_status("Connection failed", "error")
             except Exception as e:
@@ -1207,8 +1140,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         threading.Thread(target=init).start()
 
     def _disconnect_internal(self):
-        """Internal disconnect logic - cleanly closes existing connection.
-        NOTE: This method may block (thread.join), so it must only be called from background threads."""
         self._log("Closing SSE connection...")
         self.sse_running = False
         if self.sse_thread and self.sse_thread.is_alive():
@@ -1227,7 +1158,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             self.last_progress_time.clear()
 
     def _on_disconnect_click(self, event):
-        """Handle Disconnect button click - runs disconnect off the EDT"""
         def do_disconnect():
             self._disconnect_internal()
             
@@ -1244,7 +1174,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         threading.Thread(target=do_disconnect).start()
 
     def _send_request_sync(self, method, params=None, req_id=None):
-        """Send a synchronous JSON-RPC request via Burp's networking stack"""
         if not req_id:
             req_id = "req_%s" % threading.currentThread().ident
         payload = json.dumps({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params or {}})
@@ -1257,8 +1186,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         
         try:
             is_https, host, port, path = self._parse_url(url)
-            
-            # Build raw HTTP POST request
+
             payload_bytes = payload.encode("utf-8")
             http_request = "POST %s HTTP/1.1\r\n" % path
             http_request += "Host: %s:%d\r\n" % (host, port)
@@ -1280,8 +1208,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             resp_info = self._helpers.analyzeResponse(resp_bytes)
             body_offset = resp_info.getBodyOffset()
             body = self._helpers.bytesToString(resp_bytes[body_offset:])
-            
-            # Extract session ID from response headers
+
             for header in resp_info.getHeaders():
                 if header.lower().startswith("mcp-session-id:"):
                     sid = header.split(":", 1)[1].strip()
@@ -1295,7 +1222,6 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
             return {"error": {"code": -1, "message": str(e)}}
 
     def _send_request_async(self, method, params, callback, timeout=None, req_id=None):
-        """Send an asynchronous JSON-RPC request via Burp's networking stack"""
         if not timeout:
             timeout = self.request_timeout
         if not req_id:
@@ -1311,8 +1237,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
         def req_thread():
             try:
                 is_https, host, port, path = self._parse_url(url)
-                
-                # Build raw HTTP POST request
+
                 payload_bytes = payload.encode("utf-8")
                 http_request = "POST %s HTTP/1.1\r\n" % path
                 http_request += "Host: %s:%d\r\n" % (host, port)
@@ -1342,8 +1267,7 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                 status = resp_info.getStatusCode()
                 body_offset = resp_info.getBodyOffset()
                 body = self._helpers.bytesToString(resp_bytes[body_offset:])
-                
-                # Extract session ID from response headers
+
                 for header in resp_info.getHeaders():
                     if header.lower().startswith("mcp-session-id:"):
                         sid = header.split(":", 1)[1].strip()
@@ -1352,19 +1276,28 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                         break
                 
                 if status == 202:
-                    # Async response — wait for SSE to deliver the result
+
                     def monitor():
                         start = time.time()
                         while True:
                             with self._lock:
                                 still_pending = req_id in self.pending_requests
+                                last_progress = self.last_progress_time.get(req_id, start)
                             if not still_pending:
                                 break
-                            if time.time() - start > self.max_total_timeout:
+                            now = time.time()
+                            if now - start > self.max_total_timeout:
                                 break
+                            if self.reset_on_progress:
+                                if now - last_progress > self.request_timeout:
+                                    break
+                            else:
+                                if now - start > self.request_timeout:
+                                    break
                             time.sleep(1)
                         with self._lock:
                             cb = self.pending_requests.pop(req_id, None)
+                            self.last_progress_time.pop(req_id, None)
                         if cb:
                             cb({"error": {"code": -32000, "message": "Timeout"}})
                     t = threading.Thread(target=monitor)
@@ -1439,21 +1372,16 @@ class BurpExtender(IBurpExtender, ITab, IMessageEditorController, IExtensionStat
                 self._update_status("No prompts", "info")
         self._send_request_async("prompts/list", {}, handle)
 
-    # =============================================
-    # Virtual Proxy Tab - Bridge MCP to Repeater/Intruder
-    # =============================================
     
     def _create_proxy_tab(self):
-        """Create the Virtual Proxy tab for Repeater/Intruder integration"""
         panel = JPanel(BorderLayout())
-        
-        # Info panel
+
         info_panel = JPanel(BorderLayout())
         info_panel.setBorder(BorderFactory.createTitledBorder("Virtual Proxy for Burp Repeater/Intruder"))
         
         info_text = """HOW IT WORKS:
 -----------------------------
-MCP uses asynchronous SSE/WebSocket transport, but Burp's Repeater expects synchronous HTTP.
+MCP uses asynchronous SSE transport, but Burp's Repeater expects synchronous HTTP.
 The Virtual Proxy bridges this gap:
 
 1. Start the proxy on a local port (e.g., 127.0.0.1:8899)
@@ -1478,8 +1406,7 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
         info_area.setFont(Font("Monospaced", Font.PLAIN, 12))
         info_area.setBackground(self.theme_colors["status_bg"])
         info_panel.add(JScrollPane(info_area), BorderLayout.CENTER)
-        
-        # Control panel
+
         control_panel = JPanel(FlowLayout(FlowLayout.LEFT))
         control_panel.setBorder(BorderFactory.createTitledBorder("Proxy Controls"))
         
@@ -1500,44 +1427,40 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
         self.proxy_status_label = JLabel("Proxy: Stopped")
         self.proxy_status_label.setFont(Font("SansSerif", Font.BOLD, 12))
         control_panel.add(self.proxy_status_label)
-        
-        # Proxy log
+
         log_panel = JPanel(BorderLayout())
         log_panel.setBorder(BorderFactory.createTitledBorder("Proxy Log"))
         self.proxy_log_area = JTextArea(10, 60)
         self.proxy_log_area.setEditable(False)
         self.proxy_log_area.setFont(Font("Monospaced", Font.PLAIN, 11))
-        # Set initial placeholder since verbose_logging defaults to False
+
         if not self.verbose_logging:
             self.proxy_log_area.setText("=== LOGGING DISABLED ===\n\nTo save memory, logging is OFF.\n\nTo enable logs:\n- Go to 'Logs' tab\n- Check 'Verbose Logging' checkbox\n\nProxy status is shown above and in the status bar.")
         log_panel.add(JScrollPane(self.proxy_log_area), BorderLayout.CENTER)
-        
-        # Layout
+
         top_panel = JPanel(BorderLayout())
         top_panel.add(info_panel, BorderLayout.CENTER)
         top_panel.add(control_panel, BorderLayout.SOUTH)
         
         panel.add(top_panel, BorderLayout.NORTH)
         panel.add(log_panel, BorderLayout.CENTER)
-        
-        # Initialize proxy state
+
         self.proxy_server = None
         self.proxy_running = False
         
         return panel
     
     def _proxy_log(self, message, force=False):
-        """Log message to proxy log area. Skipped entirely when verbose_logging is False, unless force=True."""
         if not self.verbose_logging and not force:
             return
         def update():
             try:
-                # Clear placeholder text when force logging (critical messages)
+
                 current_text = self.proxy_log_area.getText()
                 if force and "=== LOGGING DISABLED ===" in current_text:
                     self.proxy_log_area.setText("")
                 self.proxy_log_area.append(time.strftime("[%H:%M:%S] ") + message + "\n")
-                # Limit proxy log size
+
                 text = self.proxy_log_area.getText()
                 lines = text.split('\n')
                 if len(lines) > self.max_log_lines:
@@ -1548,15 +1471,10 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
         SwingUtilities.invokeLater(update)
     
     def _start_proxy(self, event):
-        """Start the virtual proxy server"""
-        self._callbacks.printOutput("MCP: _start_proxy called")
-        
         if self.proxy_running:
-            self._callbacks.printOutput("MCP: Proxy already running, returning")
             return
         
         if not self.session_id:
-            self._callbacks.printOutput("MCP: No session_id, showing dialog")
             JOptionPane.showMessageDialog(self.panel, 
                 "Please connect to an MCP server first before starting the proxy.",
                 "Not Connected", JOptionPane.WARNING_MESSAGE)
@@ -1564,7 +1482,6 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
         
         try:
             port = int(self.proxy_port_field.getText())
-            self._callbacks.printOutput("MCP: Using port %d" % port)
         except:
             JOptionPane.showMessageDialog(self.panel, "Invalid port number", 
                 "Error", JOptionPane.ERROR_MESSAGE)
@@ -1572,47 +1489,34 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
         
         def run_proxy():
             from java.net import ServerSocket, InetAddress, InetSocketAddress
-            from java.io import BufferedReader, InputStreamReader, PrintWriter
-            
-            self._callbacks.printOutput("MCP: run_proxy thread started")
             
             try:
-                # Close any existing server first
+
                 if self.proxy_server:
                     try:
-                        self._callbacks.printOutput("MCP: Closing existing server socket")
                         self.proxy_server.close()
                     except:
                         pass
                     self.proxy_server = None
                 
-                self._callbacks.printOutput("MCP: Creating ServerSocket on port %d" % port)
                 self.proxy_server = ServerSocket()
-                self.proxy_server.setReuseAddress(True)  # Allow immediate rebind
+                self.proxy_server.setReuseAddress(True)
                 self.proxy_server.bind(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 50)
                 self.proxy_running = True
-                self._callbacks.printOutput("MCP: ServerSocket created, proxy_running = True")
                 
                 def update_ui():
-                    self._callbacks.printOutput("MCP: update_ui called")
-                    try:
-                        self.start_proxy_btn.setEnabled(False)
-                        self.stop_proxy_btn.setEnabled(True)
-                        self.proxy_status_label.setText("Proxy: Running on 127.0.0.1:%d" % port)
-                        self.proxy_status_label.setForeground(Color(0, 128, 0))
-                        # Show and update persistent proxy indicator
-                        self.proxy_indicator.setText("  PROXY: ON (:%d)  " % port)
-                        self.proxy_indicator.setVisible(True)
-                        self._callbacks.printOutput("MCP: UI updated successfully")
-                    except Exception as e:
-                        self._callbacks.printOutput("MCP: update_ui error: %s" % str(e))
+                    self.start_proxy_btn.setEnabled(False)
+                    self.stop_proxy_btn.setEnabled(True)
+                    self.proxy_status_label.setText("Proxy: Running on 127.0.0.1:%d" % port)
+                    self.proxy_status_label.setForeground(Color(0, 128, 0))
+
+                    self.proxy_indicator.setText("  PROXY: ON (:%d)  " % port)
+                    self.proxy_indicator.setVisible(True)
                 SwingUtilities.invokeLater(update_ui)
-                
-                # Force these critical messages to always show
+
                 self._proxy_log("Proxy started on 127.0.0.1:%d" % port, force=True)
                 self._proxy_log("Send JSON-RPC requests to: http://127.0.0.1:%d/" % port, force=True)
                 
-                self._callbacks.printOutput("MCP: Entering accept loop")
                 while self.proxy_running:
                     try:
                         client = self.proxy_server.accept()
@@ -1625,33 +1529,28 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
                         break
                         
             except Exception as e:
-                self._callbacks.printOutput("MCP: run_proxy exception: %s" % str(e))
+                self._callbacks.printOutput("MCP: Failed to start proxy: %s" % str(e))
                 self._proxy_log("Failed to start proxy: %s" % str(e), force=True)
                 self.proxy_running = False
         
-        self._callbacks.printOutput("MCP: Starting proxy thread")
         t = threading.Thread(target=run_proxy)
         t.setDaemon(True)
         t.start()
-        self._callbacks.printOutput("MCP: Proxy thread started")
     
     def _handle_proxy_request(self, client):
-        """Handle an incoming proxy request"""
-        from java.io import BufferedReader, InputStreamReader, PrintWriter, BufferedOutputStream
+        from java.io import BufferedReader, InputStreamReader, BufferedOutputStream
         
         try:
             reader = BufferedReader(InputStreamReader(client.getInputStream()))
             out = BufferedOutputStream(client.getOutputStream())
-            
-            # Read HTTP request
+
             request_line = reader.readLine()
             if not request_line:
                 client.close()
                 return
             
             self._proxy_log("Request: %s" % request_line)
-            
-            # Read headers
+
             headers = {}
             content_length = 0
             while True:
@@ -1663,8 +1562,7 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
                     headers[key.strip().lower()] = val.strip()
                     if key.strip().lower() == "content-length":
                         content_length = int(val.strip())
-            
-            # Read body
+
             body = ""
             if content_length > 0:
                 chars = []
@@ -1689,8 +1587,7 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
             
             self._proxy_log("JSON-RPC: method=%s id=%s" % (
                 request_json.get("method", "?"), request_json.get("id", "?")))
-            
-            # Forward to MCP and wait for response
+
             response_holder = {"response": None, "done": False}
             
             def on_response(resp):
@@ -1704,8 +1601,7 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
                 timeout=self.request_timeout,
                 req_id=request_json.get("id", "proxy_req_%d" % int(time.time() * 1000))
             )
-            
-            # Wait for response (with timeout)
+
             start = time.time()
             while not response_holder["done"] and time.time() - start < self.request_timeout:
                 time.sleep(0.1)
@@ -1731,7 +1627,6 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
                 pass
     
     def _send_proxy_response(self, out, status_code, response_body):
-        """Send HTTP response back to Repeater"""
         body_json = json.dumps(response_body, indent=2)
         body_bytes = body_json.encode("utf-8")
         
@@ -1748,7 +1643,6 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
         out.flush()
     
     def _stop_proxy(self, event):
-        """Stop the virtual proxy server"""
         self.proxy_running = False
         if self.proxy_server:
             try:
@@ -1762,19 +1656,14 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
             self.stop_proxy_btn.setEnabled(False)
             self.proxy_status_label.setText("Proxy: Stopped")
             self.proxy_status_label.setForeground(Color.GRAY)
-            # Hide proxy indicator
+
             self.proxy_indicator.setVisible(False)
         SwingUtilities.invokeLater(update_ui)
         
         self._proxy_log("Proxy stopped", force=True)
 
-    # =============================================
-    # Send to Repeater (Context Menu Integration)
-    # =============================================
     
     def _send_to_repeater(self, tool_name):
-        """Send a tool call to Burp Repeater via Virtual Proxy.
-        Runs blocking proxy auto-start off the EDT."""
         tool = next((t for t in self.tools if t["name"] == tool_name), None)
         if not tool:
             return
@@ -1802,13 +1691,12 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
         
         def do_send():
             try:
-                # Auto-start proxy if not running (blocking, runs in background thread)
+
                 if not self.proxy_running and self.session_id:
                     self._log("Auto-starting Virtual Proxy for Repeater...")
                     self._start_proxy(None)
-                    time.sleep(0.5)  # Give proxy time to start
-                
-                # Create HTTP request for Virtual Proxy (localhost)
+                    time.sleep(0.5)
+
                 http_request = "POST / HTTP/1.1\r\n"
                 http_request += "Host: 127.0.0.1:%d\r\n" % proxy_port
                 http_request += "Content-Type: application/json\r\n"
@@ -1816,8 +1704,7 @@ TIP: Right-click a tool in the Tools tab -> 'Send to Repeater'
                 http_request += "Content-Length: %d\r\n" % len(request_json)
                 http_request += "\r\n"
                 http_request += request_json
-                
-                # Send to Repeater targeting the Virtual Proxy
+
                 self._callbacks.sendToRepeater(
                     "127.0.0.1", proxy_port, False,
                     self._helpers.stringToBytes(http_request),
